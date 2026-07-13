@@ -3,6 +3,7 @@ mod config;
 mod cors;
 
 type Error = Box<dyn std::error::Error + Send + Sync>;
+const SSE_BROADCAST_CAPACITY: usize = 16;
 
 use crate::basic_auth::BasicAuth;
 use crate::cors::Cors;
@@ -28,6 +29,7 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::broadcast;
 use tokio_stream::wrappers::BroadcastStream;
 use tokio_stream::StreamExt as _;
+use tokio::signal::unix::{signal, SignalKind};
 
 #[derive(Clone)]
 struct AppState {
@@ -46,7 +48,7 @@ async fn main() -> Result<(), Error> {
     let config = config::Config::get_config()?;
     let cors = Cors::new(config.cors)?;
 
-    let (tx, _rx) = broadcast::channel::<String>(16);
+    let (tx, _rx) = broadcast::channel::<String>(SSE_BROADCAST_CAPACITY);
     let basic_auth = BasicAuth::new(config.basic_auth_users);
     let state = Arc::new(AppState { tx, basic_auth });
 
@@ -59,7 +61,10 @@ async fn main() -> Result<(), Error> {
 
     let listener = tokio::net::TcpListener::bind("0.0.0.0:12013").await.unwrap();
     log::info!("Server listening on http://0.0.0.0:12013");
-    axum::serve(listener, app).await.unwrap();
+
+    axum::serve(listener, app)
+        .with_graceful_shutdown(shutdown_signal())
+        .await?;
 
     Ok(())
 }
@@ -120,4 +125,17 @@ async fn publish_notification(
     }
 
     (StatusCode::NO_CONTENT).into_response()
+}
+
+async fn shutdown_signal() {
+    let mut sigint = signal(SignalKind::interrupt())
+        .expect("failed to bind SIGINT handler");
+
+    let mut sigterm = signal(SignalKind::terminate())
+        .expect("failed to bind SIGTERM handler");
+
+    tokio::select! {
+        _ = sigint.recv() => log::info!("SIGINT received, Gracefully shutting down."),
+        _ = sigterm.recv() => log::info!("SIGTERM received, Gracefully shutting down."),
+    }
 }
