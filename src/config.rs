@@ -1,6 +1,8 @@
 use crate::Error;
 use serde::Deserialize;
 
+use std::collections::HashMap;
+
 #[derive(Deserialize, Debug)]
 pub struct Cors {
     pub allow_credentials: bool,
@@ -12,7 +14,7 @@ pub struct Cors {
 #[derive(Deserialize, Debug)]
 pub struct Config {
     pub cors: Cors,
-    // pub basic_auth_users: HashMap<String, String>,
+    pub basic_auth_users: HashMap<String, String>,
 }
 
 impl Config {

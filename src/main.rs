@@ -1,19 +1,22 @@
+mod basic_auth;
 mod config;
 mod cors;
 
 type Error = Box<dyn std::error::Error + Send + Sync>;
 
+use crate::basic_auth::BasicAuth;
 use crate::cors::Cors;
 
 use std::collections::HashMap;
 use std::convert::Infallible;
+use std::sync::Arc;
 
 use axum::Json;
 use axum::response::IntoResponse;
 use axum::{
     extract::State,
     response::sse::{Event, KeepAlive, Sse},
-    routing::get,
+    routing::{get, post},
     Router,
 };
 
@@ -29,6 +32,7 @@ use tokio_stream::StreamExt as _;
 #[derive(Clone)]
 struct AppState {
     tx: broadcast::Sender<String>,
+    basic_auth: BasicAuth
 }
 
 #[tokio::main]
@@ -43,12 +47,13 @@ async fn main() -> Result<(), Error> {
     let cors = Cors::new(config.cors)?;
 
     let (tx, _rx) = broadcast::channel::<String>(16);
-    let state = AppState { tx };
+    let basic_auth = BasicAuth::new(config.basic_auth_users);
+    let state = Arc::new(AppState { tx, basic_auth });
 
     let app = Router::new()
-        .route("/api/amora/notifications",
-            get(subscribe_notifications)
-            .post(publish_notification))
+        .route("/api/amora/notifications", get(subscribe_notifications))
+        .route("/api/amora/notifications", post(publish_notification)
+            .route_layer(axum::middleware::from_fn_with_state(state.clone(), basic_auth::basic_auth)))
         .layer(cors)
         .with_state(state);
 
@@ -77,7 +82,7 @@ struct AlertManagerPayload {
 }
 
 async fn subscribe_notifications(
-    State(state): State<AppState>,
+    State(state): State<Arc<AppState>>,
 ) -> Sse<impl Stream<Item = Result<Event, Infallible>>> {
     let rx = state.tx.subscribe();
     
@@ -92,7 +97,7 @@ async fn subscribe_notifications(
 }
 
 async fn publish_notification(
-    State(state): State<AppState>,
+    State(state): State<Arc<AppState>>,
     Json(payload): Json<AlertManagerPayload>
 ) -> impl IntoResponse {
     let json_string = match serde_json::to_string(&payload) {
