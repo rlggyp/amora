@@ -33,7 +33,7 @@ use tokio::signal::unix::{signal, SignalKind};
 
 #[derive(Clone)]
 struct AppState {
-    tx: broadcast::Sender<String>,
+    tx: broadcast::Sender<AlertManagerPayload>,
     basic_auth: BasicAuth
 }
 
@@ -48,7 +48,7 @@ async fn main() -> Result<(), Error> {
     let config = config::Config::get_config()?;
     let cors = Cors::new(config.cors)?;
 
-    let (tx, _rx) = broadcast::channel::<String>(SSE_BROADCAST_CAPACITY);
+    let (tx, _rx) = broadcast::channel::<AlertManagerPayload>(SSE_BROADCAST_CAPACITY);
     let basic_auth = BasicAuth::new(config.basic_auth_users);
     let state = Arc::new(AppState { tx, basic_auth });
 
@@ -69,7 +69,7 @@ async fn main() -> Result<(), Error> {
     Ok(())
 }
 
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 struct Alert {
     status: String,
     labels: HashMap<String, String>,
@@ -81,7 +81,7 @@ struct Alert {
     ends_at: String,
 }
 
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 struct AlertManagerPayload {
     alerts: Vec<Alert>
 }
@@ -93,9 +93,16 @@ async fn subscribe_notifications(
     
     let stream = BroadcastStream::new(rx)
         .filter_map(|res| res.ok())
-        .map(|msg| {
-            log::debug!("[sse][subscribe] streaming event to client: {}", msg);
-            Ok(Event::default().data(msg))
+        .filter_map(|msg| {
+            log::debug!("[sse][subscribe] streaming event to client: {:#?}", msg);
+            
+            match Event::default().json_data(&msg) {
+                Ok(event) => Some(Ok(event)),
+                Err(err) => {
+                    log::error!("[sse][subscribe] failed to serialize msg to json: {}", err);
+                    None
+                }
+            }
         });
 
     Sse::new(stream).keep_alive(KeepAlive::new())
@@ -105,17 +112,9 @@ async fn publish_notification(
     State(state): State<Arc<AppState>>,
     Json(payload): Json<AlertManagerPayload>
 ) -> impl IntoResponse {
-    let json_string = match serde_json::to_string(&payload) {
-        Ok(s) => s,
-        Err(e) => {
-            log::error!("[sse][publish] serialization error: {}", e);
-            return (StatusCode::BAD_REQUEST, "Invalid payload").into_response();
-        }
-    };
+    log::debug!("[sse][publish] incoming notification payload: {:#?}", payload);
 
-    log::debug!("[sse][publish] incoming notification payload: {}", json_string);
-
-    match state.tx.send(json_string) {
+    match state.tx.send(payload) {
         Ok(receiver_count) => {
             log::debug!("[sse][publish] successfully broadcasted to {} client(s)", receiver_count);
         },

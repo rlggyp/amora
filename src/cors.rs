@@ -41,7 +41,7 @@ impl Cors {
                 origin.parse::<HeaderValue>().map_err(|e| {
                     let err_msg = format!("failed to parse origin {}: {}", origin, e);
                     log::error!("{}", err_msg);
-                    Error::from(err_msg) // Pastikan dikonversi ke crate::Error kamu
+                    Error::from(err_msg)
                 })
             })
             .collect()

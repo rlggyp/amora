@@ -17,12 +17,10 @@ base64 = "0.22.1"
 bcrypt = "0.19.2"
 blake3 = "1.8.5"
 futures = "0.3.32"
-getrandom = "0.4.3"
 http = "1.4.2"
 log = "0.4.33"
 log4rs = "1.4.0"
 serde = { version = "1.0.228", features = ["derive"] }
-serde_json = "1.0.150"
 serde_yaml = "0.9.34"
 tokio = { version = "1.52.3", features = ["rt-multi-thread", "signal"] }
 tokio-stream = { version = "0.1.18", features = ["sync"] }

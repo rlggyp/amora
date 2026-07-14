@@ -1,5 +1,6 @@
 use crate::AppState;
 
+use std::time::SystemTime;
 use std::{collections::{HashMap, HashSet}, sync::Arc};
 use axum::{extract::{Request, State}, http::{HeaderMap, HeaderValue, StatusCode, header}, middleware::Next, response::{IntoResponse, Response}};
 use base64::{engine::general_purpose, Engine};
@@ -20,9 +21,15 @@ pub struct BasicAuth {
 
 impl BasicAuth {
     pub fn new(credentials: HashMap<String, String>) -> Self {
-        let mut key = [0u8; 32];
-        getrandom::fill(&mut key).expect("Failed to generate random key");
+        let timestamp = SystemTime::now().duration_since(SystemTime::UNIX_EPOCH)
+            .expect("Failed to get current timestamp")
+            .as_nanos()
+            .to_string()
+            .as_bytes()
+            .to_owned();
         
+        let key = blake3::hash(&timestamp).as_bytes().to_owned();
+
         Self {
             credentials,
             hashed_credential_cache: Arc::new(RwLock::new(HashSet::new())),
