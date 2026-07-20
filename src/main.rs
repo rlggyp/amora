@@ -21,20 +21,21 @@ use axum::{
     Router,
 };
 
-use futures::stream::Stream;
+use futures_util::stream::{Stream, StreamExt};
 
 use http::StatusCode;
 use serde::{Deserialize, Serialize};
 
 use tokio::sync::broadcast;
 use tokio_stream::wrappers::BroadcastStream;
-use tokio_stream::StreamExt as _;
 use tokio::signal::unix::{signal, SignalKind};
+use tokio_util::sync::CancellationToken;
 
 #[derive(Clone)]
 struct AppState {
     tx: broadcast::Sender<AlertManagerPayload>,
-    basic_auth: BasicAuth
+    basic_auth: BasicAuth,
+    shutdown_token: CancellationToken
 }
 
 #[tokio::main]
@@ -50,7 +51,13 @@ async fn main() -> Result<(), Error> {
 
     let (tx, _rx) = broadcast::channel::<AlertManagerPayload>(SSE_BROADCAST_CAPACITY);
     let basic_auth = BasicAuth::new(config.basic_auth_users);
-    let state = Arc::new(AppState { tx, basic_auth });
+    let shutdown_token = CancellationToken::new();
+
+    let state = Arc::new(AppState {
+        tx,
+        basic_auth,
+        shutdown_token: shutdown_token.clone()
+    });
 
     let app = Router::new()
         .route("/api/amora/notifications", get(subscribe_notifications))
@@ -63,8 +70,12 @@ async fn main() -> Result<(), Error> {
     log::info!("Server listening on http://0.0.0.0:12013");
 
     axum::serve(listener, app)
-        .with_graceful_shutdown(shutdown_signal())
+        .with_graceful_shutdown({
+            shutdown_signal(shutdown_token.clone())
+        })
         .await?;
+
+    log::info!("Server stopped successfully.");
 
     Ok(())
 }
@@ -90,10 +101,12 @@ async fn subscribe_notifications(
     State(state): State<Arc<AppState>>,
 ) -> Sse<impl Stream<Item = Result<Event, Infallible>>> {
     let rx = state.tx.subscribe();
-    
+    let token = state.shutdown_token.clone();
+
     let stream = BroadcastStream::new(rx)
-        .filter_map(|res| res.ok())
-        .filter_map(|msg| {
+        .filter_map(|res| async move {
+            let msg = res.ok()?;
+
             log::debug!("[sse][subscribe] streaming event to client: {:#?}", msg);
             
             match Event::default().json_data(&msg) {
@@ -103,7 +116,8 @@ async fn subscribe_notifications(
                     None
                 }
             }
-        });
+        })
+        .take_until(async move { token.cancelled().await });
 
     Sse::new(stream).keep_alive(KeepAlive::new())
 }
@@ -126,7 +140,7 @@ async fn publish_notification(
     (StatusCode::NO_CONTENT).into_response()
 }
 
-async fn shutdown_signal() {
+async fn shutdown_signal(shutdown_token: CancellationToken) {
     let mut sigint = signal(SignalKind::interrupt())
         .expect("failed to bind SIGINT handler");
 
@@ -134,7 +148,13 @@ async fn shutdown_signal() {
         .expect("failed to bind SIGTERM handler");
 
     tokio::select! {
-        _ = sigint.recv() => log::info!("SIGINT received, Gracefully shutting down."),
-        _ = sigterm.recv() => log::info!("SIGTERM received, Gracefully shutting down."),
+        _ = sigint.recv() => {
+            shutdown_token.cancel();
+            log::info!("SIGINT received, Gracefully shutting down.")
+        },
+        _ = sigterm.recv() => {
+            shutdown_token.cancel();
+            log::info!("SIGTERM received, Gracefully shutting down.")
+        },
     }
 }
