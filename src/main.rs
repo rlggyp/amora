@@ -1,81 +1,101 @@
-mod basic_auth;
+mod auth;
 mod config;
 mod cors;
 
 type Error = Box<dyn std::error::Error + Send + Sync>;
-const SSE_BROADCAST_CAPACITY: usize = 16;
+const SSE_BROADCAST_CAPACITY: usize = 256;
 
-use crate::basic_auth::BasicAuth;
+use crate::auth::auth_bearer;
 use crate::cors::Cors;
 
 use std::collections::HashMap;
 use std::convert::Infallible;
+use std::net::SocketAddr;
 use std::sync::Arc;
 
-use axum::Json;
+use axum::http::StatusCode;
 use axum::response::IntoResponse;
 use axum::{
     extract::State,
     response::sse::{Event, KeepAlive, Sse},
     routing::{get, post},
-    Router,
+    Json, Router,
 };
 
 use futures_util::stream::{Stream, StreamExt};
-
-use http::StatusCode;
 use serde::{Deserialize, Serialize};
 
+use tokio::signal::unix::{signal, SignalKind};
 use tokio::sync::broadcast;
 use tokio_stream::wrappers::BroadcastStream;
-use tokio::signal::unix::{signal, SignalKind};
 use tokio_util::sync::CancellationToken;
 
 #[derive(Clone)]
-struct AppState {
+pub struct AppState {
     tx: broadcast::Sender<AlertManagerPayload>,
-    basic_auth: BasicAuth,
-    shutdown_token: CancellationToken
+    shutdown_token: CancellationToken,
+    bearer_token: Option<Arc<String>>,
+    keep_alive_interval: u64,
 }
 
 #[tokio::main]
 async fn main() -> Result<(), Error> {
-    let log_config_file = std::env::var("LOG_CONFIG_FILE")
-        .expect("Environment variable `LOG_CONFIG_FILE` not found");
-
-    log4rs::init_file(&log_config_file, Default::default())
-        .expect("Failed to init log4rs");
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
+        )
+        .init();
 
     let config = config::Config::get_config()?;
+    let keep_alive_interval = config.get_keep_alive_interval();
+    let bearer_token = config.bearer_token.map(Arc::new);
     let cors = Cors::new(config.cors)?;
 
     let (tx, _rx) = broadcast::channel::<AlertManagerPayload>(SSE_BROADCAST_CAPACITY);
-    let basic_auth = BasicAuth::new(config.basic_auth_users);
     let shutdown_token = CancellationToken::new();
 
     let state = Arc::new(AppState {
         tx,
-        basic_auth,
-        shutdown_token: shutdown_token.clone()
+        shutdown_token: shutdown_token.clone(),
+        bearer_token,
+        keep_alive_interval,
     });
 
-    let app = Router::new()
-        .route("/api/amora/notifications", get(subscribe_notifications))
-        .route("/api/amora/notifications", post(publish_notification)
-            .route_layer(axum::middleware::from_fn_with_state(state.clone(), basic_auth::basic_auth)))
-        .layer(cors)
-        .with_state(state);
+    let api_routes = Router::new()
+        .route("/api/events", get(subscribe_events))
+        .route(
+            "/api/webhook",
+            post(publish_webhook)
+                .route_layer(axum::middleware::from_fn_with_state(
+                    state.clone(),
+                    auth_bearer,
+                )),
+        );
 
-    let listener = tokio::net::TcpListener::bind("0.0.0.0:12013").await.unwrap();
-    log::info!("Server listening on http://0.0.0.0:12013");
+    let base_path = config::Config::get_base_path();
+
+    let app = match base_path.as_deref() {
+        Some(base) => Router::new().nest(base, api_routes),
+        None => api_routes,
+    }
+    .layer(cors)
+    .with_state(state);
+
+    let port = config::Config::get_port();
+    let addr = SocketAddr::from(([0, 0, 0, 0], port));
+    let listener = tokio::net::TcpListener::bind(addr).await?;
+    tracing::info!(
+        "Server listening on http://{}{}",
+        addr,
+        base_path.as_deref().unwrap_or("")
+    );
 
     axum::serve(listener, app)
-        .with_graceful_shutdown({
-            shutdown_signal(shutdown_token.clone())
-        })
+        .with_graceful_shutdown(shutdown_signal(shutdown_token))
         .await?;
 
-    log::info!("Server stopped successfully.");
+    tracing::info!("Server stopped successfully.");
 
     Ok(())
 }
@@ -94,10 +114,10 @@ struct Alert {
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 struct AlertManagerPayload {
-    alerts: Vec<Alert>
+    alerts: Vec<Alert>,
 }
 
-async fn subscribe_notifications(
+async fn subscribe_events(
     State(state): State<Arc<AppState>>,
 ) -> Sse<impl Stream<Item = Result<Event, Infallible>>> {
     let rx = state.tx.subscribe();
@@ -107,54 +127,53 @@ async fn subscribe_notifications(
         .filter_map(|res| async move {
             let msg = res.ok()?;
 
-            log::debug!("[sse][subscribe] streaming event to client: {:#?}", msg);
-            
+            tracing::debug!("Streaming event to client: {:?}", msg);
+
             match Event::default().json_data(&msg) {
                 Ok(event) => Some(Ok(event)),
                 Err(err) => {
-                    log::error!("[sse][subscribe] failed to serialize msg to json: {}", err);
+                    tracing::error!("Failed to serialize msg to json: {}", err);
                     None
                 }
             }
         })
         .take_until(async move { token.cancelled().await });
 
-    Sse::new(stream).keep_alive(KeepAlive::new())
+    Sse::new(stream).keep_alive(
+        KeepAlive::new().interval(std::time::Duration::from_secs(state.keep_alive_interval)),
+    )
 }
 
-async fn publish_notification(
+async fn publish_webhook(
     State(state): State<Arc<AppState>>,
-    Json(payload): Json<AlertManagerPayload>
+    Json(payload): Json<AlertManagerPayload>,
 ) -> impl IntoResponse {
-    log::debug!("[sse][publish] incoming notification payload: {:#?}", payload);
+    tracing::debug!("Incoming notification payload: {:?}", payload);
 
     match state.tx.send(payload) {
         Ok(receiver_count) => {
-            log::debug!("[sse][publish] successfully broadcasted to {} client(s)", receiver_count);
-        },
+            tracing::debug!("Successfully broadcasted to {} client(s)", receiver_count);
+        }
         Err(_) => {
-            log::warn!("[sse][publish] message sent but no active SSE subscribers connected");
+            tracing::warn!("Message sent but no active SSE subscribers connected");
         }
     }
 
-    (StatusCode::NO_CONTENT).into_response()
+    StatusCode::NO_CONTENT
 }
 
 async fn shutdown_signal(shutdown_token: CancellationToken) {
-    let mut sigint = signal(SignalKind::interrupt())
-        .expect("failed to bind SIGINT handler");
-
-    let mut sigterm = signal(SignalKind::terminate())
-        .expect("failed to bind SIGTERM handler");
+    let mut sigint = signal(SignalKind::interrupt()).expect("failed to bind SIGINT handler");
+    let mut sigterm = signal(SignalKind::terminate()).expect("failed to bind SIGTERM handler");
 
     tokio::select! {
         _ = sigint.recv() => {
             shutdown_token.cancel();
-            log::info!("SIGINT received, Gracefully shutting down.")
+            tracing::info!("SIGINT received, gracefully shutting down.");
         },
         _ = sigterm.recv() => {
             shutdown_token.cancel();
-            log::info!("SIGTERM received, Gracefully shutting down.")
+            tracing::info!("SIGTERM received, gracefully shutting down.");
         },
     }
 }

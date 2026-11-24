@@ -1,7 +1,5 @@
 use crate::{config, Error};
-
-use axum::http::HeaderValue;
-use http::{method::Method, HeaderName};
+use axum::http::{HeaderName, HeaderValue, Method};
 use std::str::FromStr;
 use tower_http::cors::CorsLayer;
 
@@ -39,9 +37,7 @@ impl Cors {
             .iter()
             .map(|origin| {
                 origin.parse::<HeaderValue>().map_err(|e| {
-                    let err_msg = format!("failed to parse origin {}: {}", origin, e);
-                    log::error!("{}", err_msg);
-                    Error::from(err_msg)
+                    Error::from(format!("failed to parse origin {}: {}", origin, e))
                 })
             })
             .collect()
@@ -52,9 +48,7 @@ impl Cors {
             .iter()
             .map(|method| {
                 Method::from_str(method).map_err(|e| {
-                    let err_msg = format!("failed to parse method {}: {}", method, e);
-                    log::error!("{}", err_msg);
-                    Error::from(err_msg)
+                    Error::from(format!("failed to parse method {}: {}", method, e))
                 })
             })
             .collect()
@@ -65,9 +59,7 @@ impl Cors {
             .iter()
             .map(|header| {
                 HeaderName::from_str(header).map_err(|e| {
-                    let err_msg = format!("failed to parse header {}: {}", header, e);
-                    log::error!("{}", err_msg);
-                    Error::from(err_msg)
+                    Error::from(format!("failed to parse header {}: {}", header, e))
                 })
             })
             .collect()
